@@ -1,4 +1,3 @@
-
 #include <jni.h>
 #include <string>
 #include <thread>
@@ -538,4 +537,149 @@ static void handle_client(int fd, JNIEnv* env) {
     }
 
     char buf[8192] = {};
-    ssize_t n = r
+    ssize_t n = recv(fd, buf, sizeof(buf)-1, 0);
+    if (n <= 0) { close(fd); return; }
+
+    std::string req(buf, n);
+    size_t ps = req.find(' ');
+    size_t pe = req.find(' ', ps + 1);
+    if (ps == std::string::npos || pe == std::string::npos) { close(fd); return; }
+
+    std::string method = req.substr(0, ps);
+    std::string path   = req.substr(ps + 1, pe - ps - 1);
+
+    if (method != "GET") {
+        send_str(fd, 405, "text/plain", "Method Not Allowed");
+        close(fd); return;
+    }
+
+    if (path.find("/mpd") == 0) {
+        std::string mpd_url = get_query_param(path, "url");
+        if (mpd_url.empty()) {
+            send_str(fd, 400, "text/plain", "?url= required");
+            close(fd); return;
+        }
+        std::string mpd = fetch_mpd(env, mpd_url);
+        if (mpd.empty()) {
+            send_str(fd, 502, "text/plain", "MPD fetch failed");
+        } else {
+            send_str(fd, 200, "application/dash+xml", mpd);
+        }
+
+    } else if (path.find("/segment/") == 0) {
+        size_t q = path.find('?');
+        std::string subpath  = path.substr(9, q != std::string::npos ? q-9 : std::string::npos);
+        std::string qs       = q != std::string::npos ? path.substr(q+1) : "";
+        std::string cache_key = subpath + (qs.empty() ? "" : "?" + qs);
+
+        // Cache hit
+        {
+            std::lock_guard<std::mutex> lock(seg_mutex);
+            auto it = seg_cache.find(cache_key);
+            if (it != seg_cache.end()) {
+                send_response(fd, 200, "video/mp4",
+                    it->second.data(), it->second.size());
+                close(fd); return;
+            }
+        }
+
+        // Fetch from CDN
+        std::string cdn_url = "https://z-m-scontent.xx.fbcdn.net/" + subpath;
+        if (!qs.empty()) {
+            std::string decoded_qs = qs;
+            // Replace &amp; with &
+            size_t p = 0;
+            while ((p = decoded_qs.find("&amp;", p)) != std::string::npos)
+                decoded_qs.replace(p, 5, "&");
+            cdn_url += "?" + decoded_qs;
+        }
+
+        std::vector<uint8_t> data = java_http_get(env, cdn_url);
+        if (data.empty()) {
+            send_str(fd, 502, "text/plain", "CDN fetch failed");
+        } else {
+            send_response(fd, 200, "video/mp4", data.data(), data.size());
+            // Store in cache with size eviction
+            std::lock_guard<std::mutex> lock(seg_mutex);
+            if (seg_cache_bytes + data.size() < MAX_SEG_BYTES) {
+                seg_cache[cache_key] = data;
+                seg_cache_bytes += data.size();
+            }
+        }
+
+    } else {
+        send_str(fd, 404, "text/plain", "Not Found");
+    }
+
+    close(fd);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5 — JNI ENTRY POINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+extern "C" {
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    g_jvm = vm;
+    return JNI_VERSION_1_6;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_ahmed_bader_matric_vip_NativeCore_init(JNIEnv* env, jclass) {
+    g_authorized = check_package(env);
+    return (jboolean) g_authorized;
+}
+
+JNIEXPORT void JNICALL
+Java_ahmed_bader_matric_vip_NativeCore_startProxy(JNIEnv* env, jclass, jint port) {
+    if (!security_ok(env)) return;
+    if (proxy_running) return;
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons((uint16_t)port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOGE("Bind failed");
+        close(server_fd);
+        server_fd = -1;
+        return;
+    }
+    listen(server_fd, 128);
+    proxy_running = true;
+    LOGI("Proxy started on port %d", port);
+
+    std::thread([]() {
+        while (proxy_running) {
+            int client = accept(server_fd, nullptr, nullptr);
+            if (client < 0) continue;
+            std::thread([client]() {
+                JNIEnv* env;
+                g_jvm->AttachCurrentThread(&env, nullptr);
+                handle_client(client, env);
+                g_jvm->DetachCurrentThread();
+            }).detach();
+        }
+    }).detach();
+}
+
+JNIEXPORT void JNICALL
+Java_ahmed_bader_matric_vip_NativeCore_stopProxy(JNIEnv*, jclass) {
+    proxy_running = false;
+    if (server_fd >= 0) { close(server_fd); server_fd = -1; }
+    LOGI("Proxy stopped");
+}
+
+JNIEXPORT jstring JNICALL
+Java_ahmed_bader_matric_vip_NativeCore_getToken(JNIEnv* env, jclass) {
+    if (!g_authorized) return env->NewStringUTF("");
+    return env->NewStringUTF(get_token().c_str());
+}
+
+} // extern "C"
