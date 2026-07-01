@@ -225,12 +225,12 @@ static bool check_signature(JNIEnv* env) {
 // Master security check — called on every proxy start
 static bool security_ok(JNIEnv* env) {
     if (!g_authorized)        return false;
-    if (is_debugger_attached()) return false;
-    if (has_tracer_pid())       return false;
-    if (is_emulator())          return false;
-    if (is_rooted())            return false;
-    if (has_hook_framework())   return false;
-    if (has_vpn_or_proxy(env))  return false;
+   // if (is_debugger_attached()) return false;
+   // if (has_tracer_pid())       return false;
+   // if (is_emulator())          return false;
+   // if (is_rooted())            return false;
+   // if (has_hook_framework())   return false;
+   // if (has_vpn_or_proxy(env))  return false;
     return true;
 }
 
