@@ -224,13 +224,13 @@ static bool check_signature(JNIEnv* env) {
 
 // Master security check — called on every proxy start
 static bool security_ok(JNIEnv* env) {
-    if (!g_authorized)        return false;
+    //if (!g_authorized)        return false;
    // if (is_debugger_attached()) return false;
    // if (has_tracer_pid())       return false;
    // if (is_emulator())          return false;
-   // if (is_rooted())            return false;
+    //if (is_rooted())            return false;
    // if (has_hook_framework())   return false;
-   // if (has_vpn_or_proxy(env))  return false;
+   //  if (has_vpn_or_proxy(env))  return false;
     return true;
 }
 
@@ -627,8 +627,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 
 JNIEXPORT jboolean JNICALL
 Java_ahmed_bader_matric_vip_NativeCore_init(JNIEnv* env, jclass) {
-    g_authorized = check_package(env);
-    return (jboolean) g_authorized;
+    //g_authorized = check_package(env);
+    //return (jboolean) g_authorized;
+    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL
