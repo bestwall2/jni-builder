@@ -376,14 +376,31 @@ static std::string get_query_param(const std::string& path, const std::string& n
     if (q == std::string::npos) return "";
     std::string qs = path.substr(q + 1);
     std::string search = name + "=";
-    // Walk each param so partial name matches (e.g. "_url") don't hit "url"
+
+    // FIXED: For "url=" specifically, take EVERYTHING after "url=" to end of string.
+    // The MPD url value is always last and contains encoded & (%26) inside it.
+    // Splitting on '&' would truncate the value at the first encoded param boundary
+    // if anything appears after it — but for safety we still walk params for other keys.
     size_t pos = 0;
     while (pos < qs.size()) {
+        if (qs.substr(pos, search.size()) == search) {
+            // Found the key — take rest of string and url-decode
+            // The value may contain %26 (encoded &) which is part of the URL value
+            // url_decode will convert %26 -> & correctly
+            std::string raw_val = qs.substr(pos + search.size());
+            // Only stop at an unencoded & (true param separator, not %26)
+            // Walk char by char to find real & vs encoded &
+            std::string encoded_val;
+            for (size_t i = 0; i < raw_val.size(); i++) {
+                if (raw_val[i] == '&') break;       // real separator
+                encoded_val += raw_val[i];
+            }
+            return url_decode(encoded_val);
+        }
+        // Skip past next '&'
         size_t amp = qs.find('&', pos);
-        std::string kv = qs.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
-        if (kv.substr(0, search.size()) == search)
-            return url_decode(kv.substr(search.size()));
-        pos = (amp == std::string::npos) ? qs.size() : amp + 1;
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
     }
     return "";
 }
@@ -468,77 +485,100 @@ static long long parse_mpd_ttl(const std::string& mpd) {
 
 static std::string rewrite_mpd(const std::string& mpd, int port) {
     std::string out;
-    out.reserve(mpd.size() + 256);
+    out.reserve(mpd.size() + 512);
     size_t pos = 0;
 
-    // The two attribute prefixes we rewrite
-    const std::string prefixes[2] = {
-        "initialization=\"https://z-m-scontent",
-        "media=\"https://z-m-scontent"
-    };
+    // FIXED: Search for just the attribute name + '=' so we can find the opening
+    // quote reliably regardless of spacing in the MPD XML.
+    // We search for 'initialization=' and 'media=' then read whatever follows.
     const std::string attr_names[2] = { "initialization", "media" };
 
     while (pos < mpd.size()) {
-        // Find whichever prefix comes first
-        size_t best_pos  = std::string::npos;
+        // Find whichever attribute comes next in the MPD
+        size_t best_pos   = std::string::npos;
         int    best_which = -1;
         for (int i = 0; i < 2; i++) {
-            size_t f = mpd.find(prefixes[i], pos);
+            // Search for: attrName="  (with equals + quote)
+            std::string needle = attr_names[i] + "=\"";
+            size_t f = mpd.find(needle, pos);
             if (f < best_pos) { best_pos = f; best_which = i; }
         }
 
-        if (best_pos == std::string::npos) {
-            // No more rewrites needed
+        if (best_pos == std::string::npos || best_which < 0) {
             out += mpd.substr(pos);
             break;
         }
 
-        // Copy everything before this match verbatim
+        // Copy everything before this attribute verbatim
         out += mpd.substr(pos, best_pos - pos);
 
-        // Find the opening quote of the URL value.
-        // The prefix already ends just before the URL, e.g.:
-        //   initialization="https://z-m-scontent
-        //                  ^ this quote is the last char of prefixes[i]
-        // We need the position just after that quote to get "https://..."
-        size_t quote_open = best_pos + attr_names[best_which].size() + 1; // +1 for '='
-        // quote_open now points at the '"' that opens the URL value
-        size_t url_start = quote_open + 1; // first char of "https://..."
+        // needle = "initialization=\"" or "media=\""
+        // url_start points to the first char of the URL value
+        size_t needle_len = attr_names[best_which].size() + 2; // +2 for ="
+        size_t url_start  = best_pos + needle_len;
 
-        // Find the CDN domain boundary: first '/' that follows the scheme+host.
-        // The host is z-m-scontent*.fbcdn.net — find ".net" then skip it.
-        size_t net_pos = mpd.find(".net", url_start);
-        if (net_pos == std::string::npos) {
-            // Malformed URL — copy as-is and stop
-            out += mpd.substr(best_pos);
-            break;
-        }
-        size_t path_start = net_pos + 4; // character after ".net" — should be '/'
-
-        // Find the closing quote of the URL value
-        size_t quote_close = mpd.find('"', path_start);
+        // Find the closing quote of the attribute value
+        size_t quote_close = mpd.find('"', url_start);
         if (quote_close == std::string::npos) {
             out += mpd.substr(best_pos);
             break;
         }
 
-        // seg_path = everything from '/' to (not including) closing quote
-        // e.g. "/v/t23.0-1/seg-001.m4s?_nc_oe=XXXX&..."
-        std::string seg_path = mpd.substr(path_start, quote_close - path_start);
+        std::string url_val = mpd.substr(url_start, quote_close - url_start);
 
-        // Build rewritten attribute:  initialization="http://127.0.0.1:PORT/segment/v/..."
-        char proxy_url[64];
-        snprintf(proxy_url, sizeof(proxy_url), "http://127.0.0.1:%d/segment", port);
+        // Only rewrite CDN URLs — skip anything that doesn't look like a CDN URL
+        if (url_val.find("z-m-scontent") == std::string::npos &&
+            url_val.find("fbcdn.net") == std::string::npos) {
+            // Not a CDN URL — copy as-is and move on
+            out += attr_names[best_which];
+            out += "=\"";
+            out += url_val;
+            out += '"';
+            pos = quote_close + 1;
+            continue;
+        }
+
+        // Extract the path portion: everything from first '/' after ".net"
+        // e.g. https://z-m-scontent.frab3-1.fna.fbcdn.net/v/seg.mp4?qs
+        //       -> /v/seg.mp4?qs
+        std::string seg_path;
+        size_t net_pos = url_val.find(".net");
+        if (net_pos != std::string::npos) {
+            // path starts at '/' after '.net'
+            size_t slash = url_val.find('/', net_pos + 4);
+            if (slash != std::string::npos)
+                seg_path = url_val.substr(slash);
+        }
+
+        if (seg_path.empty()) {
+            // Fallback: just copy original if we can't parse the path
+            out += attr_names[best_which];
+            out += "=\"";
+            out += url_val;
+            out += '"';
+            pos = quote_close + 1;
+            continue;
+        }
+
+        // Replace &amp; with & in the query string part of seg_path
+        size_t amp_pos = 0;
+        while ((amp_pos = seg_path.find("&amp;", amp_pos)) != std::string::npos)
+            seg_path.replace(amp_pos, 5, "&");
+
+        // Build: initialization="http://127.0.0.1:PORT/segment/v/seg.mp4?qs"
+        char proxy_base[64];
+        snprintf(proxy_base, sizeof(proxy_base), "http://127.0.0.1:%d/segment", port);
 
         out += attr_names[best_which];
         out += "=\"";
-        out += proxy_url;
+        out += proxy_base;
         out += seg_path;
         out += '"';
 
-        pos = quote_close + 1; // continue after closing quote
+        pos = quote_close + 1;
     }
 
+    LOGI("rewrite_mpd done: %zu bytes out", out.size());
     return out;
 }
 
@@ -552,135 +592,215 @@ static std::string rewrite_mpd(const std::string& mpd, int port) {
 
 static std::string java_http_post(JNIEnv* env, const std::string& url,
                                    const std::string& body) {
+    if (!env) { LOGE("java_http_post: env is null"); return ""; }
+
+    // FIXED: Use exact JNI class path matching package ahmed.bader.matric.vip
     jclass cls = env->FindClass("ahmed/bader/matric/vip/NativeCore");
     if (!cls) {
-        env->ExceptionClear(); // clear ClassNotFoundException
-        LOGE("java_http_post: NativeCore class not found");
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();   // prints full exception to logcat
+            env->ExceptionClear();
+        }
+        LOGE("java_http_post: class 'ahmed/bader/matric/vip/NativeCore' NOT FOUND");
+        LOGE("java_http_post: make sure NativeCore.java exists in that package");
         return "";
     }
+
     jmethodID mid = env->GetStaticMethodID(cls, "httpPost",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
     if (!mid) {
-        env->ExceptionClear();
-        LOGE("java_http_post: httpPost method not found");
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        LOGE("java_http_post: method httpPost(String,String) NOT FOUND in NativeCore");
+        env->DeleteLocalRef(cls);
         return "";
     }
+
     jstring jurl  = env->NewStringUTF(url.c_str());
     jstring jbody = env->NewStringUTF(body.c_str());
     if (!jurl || !jbody) {
-        env->ExceptionClear();
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        LOGE("java_http_post: NewStringUTF failed");
+        if (jurl)  env->DeleteLocalRef(jurl);
+        if (jbody) env->DeleteLocalRef(jbody);
+        env->DeleteLocalRef(cls);
         return "";
     }
+
+    LOGI("java_http_post: calling NativeCore.httpPost url=%.80s", url.c_str());
     jstring jres = (jstring) env->CallStaticObjectMethod(cls, mid, jurl, jbody);
     env->DeleteLocalRef(jurl);
     env->DeleteLocalRef(jbody);
+
     if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
         env->ExceptionClear();
-        LOGE("java_http_post: exception during call");
+        LOGE("java_http_post: exception thrown during httpPost call");
+        env->DeleteLocalRef(cls);
         return "";
     }
-    if (!jres) return "";
+
+    if (!jres) {
+        LOGE("java_http_post: httpPost returned null");
+        env->DeleteLocalRef(cls);
+        return "";
+    }
+
     const char* res = env->GetStringUTFChars(jres, nullptr);
-    std::string out(res);
-    env->ReleaseStringUTFChars(jres, res);
+    std::string out(res ? res : "");
+    if (res) env->ReleaseStringUTFChars(jres, res);
     env->DeleteLocalRef(jres);
+    env->DeleteLocalRef(cls);
+
+    LOGI("java_http_post: response len=%zu", out.size());
     return out;
 }
 
 static std::vector<uint8_t> java_http_get(JNIEnv* env, const std::string& url) {
+    if (!env) { LOGE("java_http_get: env is null"); return {}; }
+
     jclass cls = env->FindClass("ahmed/bader/matric/vip/NativeCore");
     if (!cls) {
-        env->ExceptionClear();
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         LOGE("java_http_get: NativeCore class not found");
         return {};
     }
+
     jmethodID mid = env->GetStaticMethodID(cls, "httpGet", "(Ljava/lang/String;)[B");
     if (!mid) {
-        env->ExceptionClear();
-        LOGE("java_http_get: httpGet method not found");
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        LOGE("java_http_get: httpGet(String) method not found");
+        env->DeleteLocalRef(cls);
         return {};
     }
+
     jstring jurl = env->NewStringUTF(url.c_str());
-    if (!jurl) { env->ExceptionClear(); return {}; }
+    if (!jurl) {
+        if (env->ExceptionCheck()) { env->ExceptionClear(); }
+        LOGE("java_http_get: NewStringUTF failed");
+        env->DeleteLocalRef(cls);
+        return {};
+    }
+
+    LOGI("java_http_get: fetching %.120s", url.c_str());
     jbyteArray jba = (jbyteArray) env->CallStaticObjectMethod(cls, mid, jurl);
     env->DeleteLocalRef(jurl);
+
     if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
         env->ExceptionClear();
-        LOGE("java_http_get: exception during call");
+        LOGE("java_http_get: exception during httpGet call");
+        env->DeleteLocalRef(cls);
         return {};
     }
-    if (!jba) return {};
+
+    if (!jba) {
+        LOGE("java_http_get: httpGet returned null");
+        env->DeleteLocalRef(cls);
+        return {};
+    }
+
     jsize len = env->GetArrayLength(jba);
-    if (len <= 0) { env->DeleteLocalRef(jba); return {}; }
+    if (len <= 0) {
+        LOGE("java_http_get: returned empty byte array");
+        env->DeleteLocalRef(jba);
+        env->DeleteLocalRef(cls);
+        return {};
+    }
+
     jbyte* bytes = env->GetByteArrayElements(jba, nullptr);
     std::vector<uint8_t> out(bytes, bytes + len);
     env->ReleaseByteArrayElements(jba, bytes, JNI_ABORT);
     env->DeleteLocalRef(jba);
+    env->DeleteLocalRef(cls);
+
+    LOGI("java_http_get: got %d bytes", (int)len);
     return out;
 }
 
 // ── MPD fetch ─────────────────────────────────────────────────────────────────
 
 static std::string fetch_mpd(JNIEnv* env, const std::string& mpd_url, int port) {
-    // Check cache — use per-URL TTL if available
+    // ── Cache check ───────────────────────────────────────────────────────────
     {
         std::lock_guard<std::mutex> lock(mpd_mutex);
         auto it = mpd_cache.find(mpd_url);
         if (it != mpd_cache.end()) {
             long long ttl = mpd_ttl.count(mpd_url) ? mpd_ttl[mpd_url] : MPD_TTL_DEFAULT;
             if (now_ms() - mpd_time[mpd_url] < ttl) {
-                LOGI("MPD cache hit: %s", mpd_url.c_str());
+                LOGI("MPD cache hit");
                 return std::string(it->second.begin(), it->second.end());
             }
+            LOGI("MPD cache expired, refetching");
         }
     }
 
     std::string token = get_token();
     std::string graph = get_graph();
 
-    // Shuffle HF order — try all three
-    int order[3] = {0, 1, 2};
-    // Simple deterministic shuffle based on current time
-    long long t = now_ms();
-    int tmp;
-    tmp = order[0]; order[0] = order[t % 3]; order[(int)(t % 3)] = tmp;
+    // FIXED: Graph API URL must NOT have trailing slash for POST
+    // get_graph() returns "https://z-m-graph.facebook.com/v22.0/"
+    // Strip trailing slash if present
+    if (!graph.empty() && graph.back() == '/') graph.pop_back();
 
+    LOGI("fetch_mpd: token len=%zu graph=%s", token.size(), graph.c_str());
+    LOGI("fetch_mpd: mpd_url=%.150s", mpd_url.c_str());
+
+    // Try all 3 HF spaces in order 0→1→2
     for (int i = 0; i < 3; i++) {
-        std::string hf_base = get_hf(order[i]);
-        std::string cb      = std::to_string(now_ms());
-        // Build the target URL that the HF Space will proxy
-        std::string target  = hf_base + "?url=" + url_encode(mpd_url) + "&_=" + cb;
-        // POST body for the Graph API scraper endpoint
-        std::string body    = "id=" + url_encode(target)
-                            + "&scrape=true&suppress_http_code=1&access_token=" + token;
+        std::string hf_base = get_hf(i);
+        LOGI("fetch_mpd: attempt %d HF=%s", i, hf_base.c_str());
 
-        LOGI("MPD fetch attempt %d via HF#%d", i, order[i]);
+        // Build the URL the HF space will fetch on our behalf
+        std::string cb     = std::to_string(now_ms());
+        std::string target = hf_base + "?url=" + url_encode(mpd_url) + "&_=" + cb;
+
+        // POST body sent to Graph API scraper
+        std::string body = "id=" + url_encode(target)
+                         + "&scrape=true"
+                         + "&suppress_http_code=1"
+                         + "&access_token=" + token;
+
+        LOGI("fetch_mpd: POSTing to graph, body len=%zu", body.size());
         std::string json = java_http_post(env, graph, body);
+
         if (json.empty()) {
-            LOGE("MPD fetch: empty JSON response from HF#%d", order[i]);
+            LOGE("fetch_mpd: empty response from Graph API (HF#%d)", i);
             continue;
         }
 
-        // The MPD content is base64-encoded in the "site_name" JSON field
+        LOGI("fetch_mpd: got json len=%zu snippet=%.100s", json.size(), json.c_str());
+
+        // Graph API returns JSON — MPD is base64-encoded in "site_name" field
         std::string sn = extract_json(json, "site_name");
         if (sn.empty()) {
-            LOGE("MPD fetch: site_name missing in response (HF#%d)", order[i]);
-            LOGI("Response snippet: %.200s", json.c_str());
+            LOGE("fetch_mpd: site_name field missing in JSON (HF#%d)", i);
+            // Log more of the response to help debug
+            LOGI("fetch_mpd: full response: %.500s", json.c_str());
             continue;
         }
 
-        // Pad base64 to a multiple of 4
+        LOGI("fetch_mpd: site_name len=%zu", sn.size());
+
+        // Pad base64 to multiple of 4
         while (sn.size() % 4 != 0) sn += '=';
+
         std::string raw_mpd = b64_decode(sn);
         if (raw_mpd.empty()) {
-            LOGE("MPD fetch: base64 decode produced empty result");
+            LOGE("fetch_mpd: base64 decode empty (HF#%d)", i);
             continue;
         }
 
-        // Rewrite CDN URLs → local proxy URLs
-        std::string rewritten = rewrite_mpd(raw_mpd, port);
+        LOGI("fetch_mpd: raw MPD %zu bytes, snippet=%.100s",
+             raw_mpd.size(), raw_mpd.c_str());
 
-        // Parse TTL from minimumUpdatePeriod (Step 6 equivalent)
+        // Rewrite CDN segment URLs → local proxy URLs
+        std::string rewritten = rewrite_mpd(raw_mpd, port);
+        if (rewritten.empty()) {
+            LOGE("fetch_mpd: rewrite_mpd returned empty");
+            continue;
+        }
+
+        // Extract TTL from minimumUpdatePeriod
         long long ttl = parse_mpd_ttl(raw_mpd);
 
         // Store in cache
@@ -692,11 +812,11 @@ static std::string fetch_mpd(JNIEnv* env, const std::string& mpd_url, int port) 
             mpd_ttl[mpd_url]   = ttl;
         }
 
-        LOGI("MPD fetch OK, %zu bytes, TTL=%lldms", rewritten.size(), ttl);
+        LOGI("fetch_mpd: SUCCESS %zu bytes TTL=%lldms", rewritten.size(), ttl);
         return rewritten;
     }
 
-    LOGE("MPD fetch: all HF Spaces failed for %s", mpd_url.c_str());
+    LOGE("fetch_mpd: all 3 HF spaces failed");
     return "";
 }
 
